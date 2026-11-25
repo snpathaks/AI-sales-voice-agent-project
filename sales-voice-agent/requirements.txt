@@ -1,17 +1,18 @@
 # ─── Core AI ───────────────────────────────────────
-google-generativeai
+google-genai
 google-cloud-texttospeech
 google-cloud-speech
+
+# ─── Specialized Voice Providers ──────────────────
+# Deepgram (STT) & ElevenLabs (TTS) REST integration
+httpx
 
 # ─── Backend / API ─────────────────────────────────
 fastapi
 uvicorn[standard]
 python-dotenv
-httpx
 
 # ─── RAG / Vector Store ────────────────────────────
-# faiss-cpu has no Python 3.14 wheels; using chromadb instead
-chromadb
 numpy
 
 # ─── Audio Processing ──────────────────────────────

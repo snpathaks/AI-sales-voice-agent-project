@@ -14,18 +14,34 @@ build/
 venv/
 env/
 
-# Secrets — NEVER commit
+# Environment Secrets — NEVER COMMIT
 .env
+.env.*
+!.env.example
 
-# FAISS index (auto-rebuilt at startup)
+# Local SQLite CRM Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Vector Index & Cache
 *.faiss
 *.index
 
-# Gradio temp files
+# Audio artifacts & temporary recordings
+*.wav
+*.mp3
+*.ogg
+*.flac
+temp_audio/
+
+# Gradio cache & logs
 gradio_cached_examples/
 flagged/
+*.log
 
-# Misc
+# OS & Editor files
 .DS_Store
 Thumbs.db
-*.log
+.vscode/
+.idea/
