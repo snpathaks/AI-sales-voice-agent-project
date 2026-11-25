@@ -1,5 +1,8 @@
 # 🤖 Autonomous AI Sales Voice Agent + CRM Pipeline
 
+> **🎬 Live Demo Video (Full End-to-End Walkthrough):**  
+> 👉 **[Watch the Project Demo on YouTube](https://youtu.be/sMdc9fFcNww?si=L5Llv_GcRInT4rTa)** (`https://youtu.be/sMdc9fFcNww?si=L5Llv_GcRInT4rTa`)
+
 An enterprise-grade, end-to-end **Autonomous AI Sales Voice & Chat Agent** built with **FastAPI**, **Gradio 6**, **Google Gemini**, **Deepgram Nova-2 (STT)**, **ElevenLabs (TTS)**, and an integrated **SQLite CRM & Lead Qualification Pipeline**.
 
 The agent, named **Alex**, acts as an autonomous sales representative for **TechNova Solutions** (defined in [`kb/company.md`](kb/company.md)), answering questions via natural voice and text, scoring leads in real time, booking demos, saving data to a CRM database, and generating post-call executive summaries.
