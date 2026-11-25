@@ -60,33 +60,110 @@ Inbound B2B sales teams face four fundamental bottlenecks:
 
 ---
 
-## 🏗️ 3. System Architecture Diagram
+## 🏗️ 3. System Design & Architecture
+
+### A. High-Level Component Architecture
 
 ```mermaid
 flowchart TD
-    User["👤 Prospect (Web / Microphone)"] <--> UI["🖥️ Gradio 6 Frontend (Port 7860)<br/>Chat + Live Lead Panel + Booking Form + CRM Dashboard"]
+    User["👤 Prospect (Web / Microphone)"] <--> UI["🖥️ Gradio 6 Frontend (Port 7860)<br/>Voice/Text Chat + Live Lead Panel + Booking + CRM Dashboard"]
     
-    UI -->|Base64 WAV Audio| STT["🎙️ Deepgram Nova-2 STT<br/>(Sub-300ms Speech-to-Text via REST/WebSocket)"]
-    STT --> API["⚡ FastAPI Backend (Port 8000)<br/>backend/main.py"]
-    UI -->|Text Message| API
+    UI -->|POST /chat/voice (Base64 WAV)| API["⚡ FastAPI Orchestrator (Port 8000)<br/>backend/main.py"]
+    UI -->|POST /chat/text (JSON)| API
+    UI -->|POST /appointments/book & /call/summary| API
 
-    subgraph Intelligence["Autonomous Sales Engine"]
+    subgraph VoiceLayer["Voice I/O Layer (Graceful Fallback)"]
+        STT["🎙️ Deepgram Nova-2 STT<br/>(Fallback: Google Cloud Speech)"]
+        TTS["🔊 ElevenLabs TTS (Alice Voice)<br/>(Fallback: Google Cloud TTS)"]
+    end
+
+    API <-->|Audio Bytes| STT
+    API <-->|Reply Text| TTS
+
+    subgraph Intelligence["AI & RAG Intelligence Engine"]
         API --> Embed["Gemini Embeddings<br/>gemini-embedding-001"]
         Embed --> VStore[("NumPy Vector Store<br/>L2-Normalized Cosine Similarity (Top-4)")]
         KB[("📄 Knowledge Base<br/>kb/company.md")] -.->|Startup Chunking & Indexing| VStore
-        VStore --> Context["Relevant Product & Pricing Context"]
+        VStore --> Context["Retrieved Product & Pricing Context"]
         
-        Context --> LLM["🧠 Gemini 3.5 Flash-Lite<br/>(Multi-Model Fallback: 3.8, 3.6, 3.7, 4-Hydrogen)"]
-        API --> LeadEngine["📊 Lead Intelligence Classifier<br/>Score (0-100), Sentiment, Intent, Stage"]
+        Context --> LLM["🧠 Gemini 3.5 Flash-Lite<br/>(Instant Fallback: 3.8, 3.6, 3.7, 4-Hydrogen)"]
+        API --> LeadEngine["📊 Lead Intelligence Classifier<br/>Structured JSON: Score, Sentiment, Intent, Stage"]
     end
-
-    LLM --> TTS["🔊 ElevenLabs TTS<br/>Premade Alice Voice (MP3 44.1kHz / 128kbps)"]
-    TTS --> AudioOut["Synthesized Voice Response"]
-    AudioOut --> UI
 
     LeadEngine --> CRMDB[("🗄️ SQLite CRM Database (crm.db)<br/>Leads & Appointments Tables")]
     API -->|Confirmed Slot Booking| CRMDB
     CRMDB -->|GET /crm/data| UI
+```
+
+### B. End-to-End Voice Turn Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    participant U as 👤 Prospect (Browser)
+    participant UI as 🖥️ Gradio 6 (:7860)
+    participant API as ⚡ FastAPI (:8000)
+    participant DG as 🎙️ Deepgram Nova-2
+    participant RAG as 📚 NumPy RAG
+    participant LLM as 🧠 Gemini LLM
+    participant EL as 🔊 ElevenLabs TTS
+    participant DB as 🗄️ SQLite (crm.db)
+
+    U->>UI: Speaks into mic & stops recording
+    UI->>API: POST /chat/voice {audio_b64, sample_rate, history}
+    API->>DG: POST /v1/listen (LINEAR16 audio)
+    DG-->>API: Transcript text (~250ms)
+    API->>RAG: Embed query & dot-product top-4 chunks
+    RAG-->>API: Relevant company.md context
+    par Sales Reply & Lead Scoring
+        API->>LLM: generate_content(context + history + transcript)
+        LLM-->>API: Concise 2-4 sentence spoken reply
+    and
+        API->>LLM: analyze_lead(history + transcript, JSON mode)
+        LLM-->>API: {score, sentiment, intent, stage, booking_slot}
+    end
+    API->>DB: INSERT/REPLACE into leads table
+    API->>EL: POST /v1/text-to-speech (reply_text)
+    EL-->>API: MP3 audio bytes
+    API-->>UI: {user_transcript, reply_text, reply_audio_b64, history, lead}
+    UI-->>U: Renders chat + updates Lead Panel + auto-plays audio
+```
+
+### C. REST API Contract (`backend/main.py`)
+
+| Method & Endpoint | Purpose | Key Payload / Response |
+|---|---|---|
+| `GET /health` | Readiness & provider check | `{"status":"ok","kb_chunks":20,"deepgram_configured":true,"elevenlabs_configured":true}` |
+| `POST /chat/text` | Text turn + RAG + Lead scoring + TTS | In: `{message, history}` → Out: `{user_transcript, reply_text, reply_audio_b64, history, lead}` |
+| `POST /chat/voice` | Voice turn: STT → RAG → LLM → Lead → TTS | In: `{audio_b64, sample_rate, history}` → Out: `AgentResponse` |
+| `POST /appointments/book` | Persist confirmed demo slot | In: `{name, email, slot, notes}` → Out: `{status, appointment_id, slot, message}` |
+| `GET /crm/data` | Fetch CRM tables for UI | Out: `{leads: [...], appointments: [...]}` (latest 20 each) |
+| `POST /call/summary` | Generate structured post-call insights | In: `{history}` → Out: `{summary: {executive_summary, key_pain_points, recommended_plan, objections_raised, next_best_action}}` |
+
+### D. CRM Database Schema (`crm.db`)
+
+```mermaid
+erDiagram
+    LEADS {
+        TEXT id PK
+        TEXT name
+        TEXT email
+        TEXT interest
+        INTEGER score
+        TEXT sentiment
+        TEXT intent
+        TEXT summary
+        TIMESTAMP created_at
+    }
+    APPOINTMENTS {
+        TEXT id PK
+        TEXT lead_id
+        TEXT name
+        TEXT email
+        TEXT slot
+        TEXT notes
+        TEXT status
+        TIMESTAMP created_at
+    }
 ```
 
 ---
