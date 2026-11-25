@@ -1,0 +1,25 @@
+# ─── Core AI ───────────────────────────────────────
+google-generativeai
+google-cloud-texttospeech
+google-cloud-speech
+
+# ─── Backend / API ─────────────────────────────────
+fastapi
+uvicorn[standard]
+python-dotenv
+httpx
+
+# ─── RAG / Vector Store ────────────────────────────
+# faiss-cpu has no Python 3.14 wheels; using chromadb instead
+chromadb
+numpy
+
+# ─── Audio Processing ──────────────────────────────
+pydub
+
+# ─── Frontend ──────────────────────────────────────
+gradio
+
+# ─── Utilities ─────────────────────────────────────
+pydantic
+markdown
