@@ -3,27 +3,22 @@ backend/main.py
 ===============
 Sales Voice Agent — FastAPI backend
 
+Uses the modern `google-genai` SDK (v1.x / google-genai package)
+which is compatible with protobuf >=7 and Python 3.14.
+
 Pipeline
 --------
-User audio (base64)
-  → Speech-to-Text  (Google Cloud Speech / Gemini Live)
-  → RAG retrieval   (FAISS + Gemini embeddings)
-  → LLM answer      (Gemini Flash)
-  → Text-to-Speech  (Google Cloud TTS)
-  → audio response  (base64 WAV)
+Text / Audio → RAG (numpy cosine) → Gemini Flash → reply text + (optional TTS)
 """
 
 from __future__ import annotations
 
 import base64
-import io
-import json
 import os
 import textwrap
 from pathlib import Path
 from typing import Any
 
-import faiss
 import numpy as np
 import uvicorn
 from dotenv import load_dotenv
@@ -31,10 +26,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ── Google Generative AI ────────────────────────────────────────────────────
-import google.generativeai as genai
-from google.cloud import speech_v1 as speech
-from google.cloud import texttospeech
+from google import genai
+from google.genai import types as genai_types
 
 # ── Load env ────────────────────────────────────────────────────────────────
 load_dotenv(Path(__file__).parent.parent / ".env")
@@ -42,18 +35,17 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 if not GEMINI_API_KEY:
     raise EnvironmentError("GEMINI_API_KEY is not set in .env")
 
-genai.configure(api_key=GEMINI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ── Constants ───────────────────────────────────────────────────────────────
-KB_PATH = Path(__file__).parent.parent / "kb" / "company.md"
-EMBED_MODEL = "models/text-embedding-004"
-CHAT_MODEL = "gemini-1.5-flash-latest"
-CHUNK_SIZE = 400          # characters per RAG chunk
+KB_PATH       = Path(__file__).parent.parent / "kb" / "company.md"
+EMBED_MODEL   = "gemini-embedding-001"
+CHAT_MODEL    = "gemini-2.0-flash"
+CHUNK_SIZE    = 400
 CHUNK_OVERLAP = 80
-TOP_K = 4                 # chunks retrieved per query
-EMBED_DIM = 768           # text-embedding-004 output dimension
+TOP_K         = 4
 
-# ── FastAPI app ─────────────────────────────────────────────────────────────
+# ── FastAPI app ──────────────────────────────────────────────────────────────
 app = FastAPI(title="Sales Voice Agent API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
@@ -62,61 +54,62 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  RAG — build FAISS index from knowledge base at startup
-# ═══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+#  RAG — pure-numpy cosine vector store (zero extra deps)
+# ════════════════════════════════════════════════════════════════════════════
 
 def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """Split *text* into overlapping character chunks."""
     chunks: list[str] = []
     start = 0
     while start < len(text):
-        end = min(start + size, len(text))
-        chunks.append(text[start:end])
+        chunks.append(text[start : start + size])
         start += size - overlap
     return chunks
 
 
-def _embed(texts: list[str]) -> np.ndarray:
-    """Return (N, EMBED_DIM) float32 matrix via Gemini embeddings."""
-    result = genai.embed_content(
+def _embed(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> np.ndarray:
+    """Embed a list of texts via google-genai → (N, D) float32, L2-normalised."""
+    result = client.models.embed_content(
         model=EMBED_MODEL,
-        content=texts,
-        task_type="retrieval_document",
+        contents=texts,
+        config=genai_types.EmbedContentConfig(task_type=task_type),
     )
-    return np.array(result["embedding"], dtype=np.float32)
+    vecs = np.array([e.values for e in result.embeddings], dtype=np.float32)
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    return vecs / norms
 
 
-class RAGIndex:
-    """Thin wrapper around a FAISS flat index + raw chunk store."""
-
-    def __init__(self, kb_path: Path) -> None:
-        raw = kb_path.read_text(encoding="utf-8")
-        self.chunks = _chunk_text(raw)
-        embeddings = _embed(self.chunks)
-        # L2-normalise → cosine similarity via inner product
-        faiss.normalize_L2(embeddings)
-        self.index = faiss.IndexFlatIP(EMBED_DIM)
-        self.index.add(embeddings)
-        print(f"[RAG] Indexed {len(self.chunks)} chunks from {kb_path.name}")
+class NumpyVectorStore:
+    def __init__(self, chunks: list[str]) -> None:
+        self.chunks = chunks
+        # embed in batches of 20
+        parts: list[np.ndarray] = []
+        for i in range(0, len(chunks), 20):
+            parts.append(_embed(chunks[i : i + 20]))
+        self._matrix = np.vstack(parts)
+        print(f"[RAG] Indexed {len(chunks)} chunks from knowledge base")
 
     def retrieve(self, query: str, k: int = TOP_K) -> list[str]:
-        q_emb = _embed([query])
-        faiss.normalize_L2(q_emb)
-        _, ids = self.index.search(q_emb, k)
-        return [self.chunks[i] for i in ids[0] if i != -1]
+        q = _embed([query], task_type="RETRIEVAL_QUERY")[0]
+        scores  = self._matrix @ q
+        top_k   = int(min(k, len(self.chunks)))
+        indices = np.argpartition(scores, -top_k)[-top_k:]
+        indices = indices[np.argsort(scores[indices])[::-1]]
+        return [self.chunks[i] for i in indices]
 
 
-# Build index once at import time (FastAPI startup)
-rag_index = RAGIndex(KB_PATH)
+# Build at startup
+_chunks   = _chunk_text(KB_PATH.read_text(encoding="utf-8"))
+rag_store = NumpyVectorStore(_chunks)
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Gemini chat session (stateless — history passed per request)
-# ═══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+#  LLM — Gemini Flash with RAG context
+# ════════════════════════════════════════════════════════════════════════════
 
 SYSTEM_PROMPT = textwrap.dedent("""\
     You are Alex, a friendly and knowledgeable sales assistant for the company
-    described in the context below. Your goal is to:
+    described in the context below. Your goals:
 
     1. Understand the customer's needs through natural conversation.
     2. Recommend the most suitable product or service from the knowledge base.
@@ -129,111 +122,99 @@ SYSTEM_PROMPT = textwrap.dedent("""\
 """)
 
 
-def _build_prompt(context: str, history: list[dict], user_message: str) -> list[dict]:
-    """Assemble the message list for Gemini (system injected as first user turn)."""
-    messages: list[dict] = [
-        {"role": "user", "parts": [SYSTEM_PROMPT.format(context=context)]},
-        {"role": "model", "parts": ["Understood. I'm ready to help customers!"]},
-    ]
-    for turn in history:
-        messages.append({"role": turn["role"], "parts": [turn["content"]]})
-    messages.append({"role": "user", "parts": [user_message]})
-    return messages
-
-
 def llm_reply(user_text: str, history: list[dict]) -> str:
-    """RAG-augmented Gemini answer."""
-    context_chunks = rag_index.retrieve(user_text)
-    context = "\n\n---\n\n".join(context_chunks)
-    messages = _build_prompt(context, history, user_text)
-    model = genai.GenerativeModel(CHAT_MODEL)
-    response = model.generate_content(messages)
+    context = "\n\n---\n\n".join(rag_store.retrieve(user_text))
+    system  = SYSTEM_PROMPT.format(context=context)
+
+    # Build contents list for the multi-turn API
+    contents: list = []
+    for turn in history:
+        role = "user" if turn["role"] == "user" else "model"
+        contents.append(genai_types.Content(role=role, parts=[genai_types.Part(text=turn["content"])]))
+    contents.append(genai_types.Content(role="user", parts=[genai_types.Part(text=user_text)]))
+
+    response = client.models.generate_content(
+        model=CHAT_MODEL,
+        contents=contents,
+        config=genai_types.GenerateContentConfig(system_instruction=system),
+    )
     return response.text.strip()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Speech helpers (Google Cloud — credentials via GOOGLE_APPLICATION_CREDENTIALS)
-#  Falls back to a stub if credentials are absent (dev mode).
-# ═══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+#  STT / TTS (Google Cloud with graceful fallback)
+# ════════════════════════════════════════════════════════════════════════════
 
 def stt_transcribe(audio_bytes: bytes, sample_rate: int = 16000) -> str:
-    """Transcribe raw LINEAR16 audio bytes → text."""
     try:
-        client = speech.SpeechClient()
-        audio = speech.RecognitionAudio(content=audio_bytes)
-        config = speech.RecognitionConfig(
+        from google.cloud import speech_v1 as speech
+        c    = speech.SpeechClient()
+        cfg  = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=sample_rate,
             language_code="en-US",
             enable_automatic_punctuation=True,
         )
-        resp = client.recognize(config=config, audio=audio)
+        resp = c.recognize(config=cfg, audio=speech.RecognitionAudio(content=audio_bytes))
         return " ".join(r.alternatives[0].transcript for r in resp.results)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[STT] Cloud unavailable ({exc}); returning placeholder.")
-        return "[STT unavailable — type your message instead]"
+    except Exception as exc:
+        print(f"[STT] unavailable ({exc})")
+        return "[STT unavailable — use the Text Chat tab]"
 
 
 def tts_synthesize(text: str) -> bytes:
-    """Synthesize *text* → WAV bytes (LINEAR16, 24 kHz)."""
     try:
-        client = texttospeech.TextToSpeechClient()
-        synthesis_input = texttospeech.SynthesisInput(text=text)
-        voice = texttospeech.VoiceSelectionParams(
-            language_code="en-US",
-            name="en-US-Neural2-D",          # natural male voice
-            ssml_gender=texttospeech.SsmlVoiceGender.MALE,
+        from google.cloud import texttospeech as tts
+        c    = tts.TextToSpeechClient()
+        resp = c.synthesize_speech(
+            input=tts.SynthesisInput(text=text),
+            voice=tts.VoiceSelectionParams(
+                language_code="en-US", name="en-US-Neural2-D",
+                ssml_gender=tts.SsmlVoiceGender.MALE,
+            ),
+            audio_config=tts.AudioConfig(
+                audio_encoding=tts.AudioEncoding.LINEAR16,
+                sample_rate_hertz=24000,
+            ),
         )
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-            sample_rate_hertz=24000,
-        )
-        response = client.synthesize_speech(
-            input=synthesis_input, voice=voice, audio_config=audio_config
-        )
-        return response.audio_content
-    except Exception as exc:  # noqa: BLE001
-        print(f"[TTS] Cloud unavailable ({exc}); returning empty audio.")
+        return resp.audio_content
+    except Exception as exc:
+        print(f"[TTS] unavailable ({exc}); returning empty audio")
         return b""
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  API schemas
-# ═══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+#  API schemas & routes
+# ════════════════════════════════════════════════════════════════════════════
 
 class TextRequest(BaseModel):
     message: str
-    history: list[dict[str, str]] = []   # [{"role": "user"|"model", "content": "..."}]
+    history: list[dict[str, str]] = []
 
 
 class VoiceRequest(BaseModel):
-    audio_b64: str                        # base64-encoded LINEAR16 PCM
+    audio_b64: str
     sample_rate: int = 16000
     history: list[dict[str, str]] = []
 
 
 class AgentResponse(BaseModel):
     reply_text: str
-    reply_audio_b64: str                  # base64 WAV (empty string if TTS unavailable)
+    reply_audio_b64: str
     history: list[dict[str, str]]
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Routes
-# ═══════════════════════════════════════════════════════════════════════════
-
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "kb_chunks": len(rag_index.chunks)}
+    return {"status": "ok", "kb_chunks": len(rag_store.chunks)}
 
 
 @app.post("/chat/text", response_model=AgentResponse)
 def chat_text(req: TextRequest) -> AgentResponse:
-    """Pure-text round-trip (no audio)."""
-    reply = llm_reply(req.message, req.history)
+    reply       = llm_reply(req.message, req.history)
     audio_bytes = tts_synthesize(reply)
     new_history = req.history + [
-        {"role": "user", "content": req.message},
+        {"role": "user",  "content": req.message},
         {"role": "model", "content": reply},
     ]
     return AgentResponse(
@@ -245,15 +226,14 @@ def chat_text(req: TextRequest) -> AgentResponse:
 
 @app.post("/chat/voice", response_model=AgentResponse)
 def chat_voice(req: VoiceRequest) -> AgentResponse:
-    """Voice round-trip: audio-in → text → LLM → audio-out."""
     audio_bytes = base64.b64decode(req.audio_b64)
-    user_text = stt_transcribe(audio_bytes, req.sample_rate)
+    user_text   = stt_transcribe(audio_bytes, req.sample_rate)
     if not user_text.strip():
-        raise HTTPException(status_code=422, detail="Could not transcribe audio.")
-    reply = llm_reply(user_text, req.history)
+        raise HTTPException(422, "Could not transcribe audio.")
+    reply       = llm_reply(user_text, req.history)
     reply_audio = tts_synthesize(reply)
     new_history = req.history + [
-        {"role": "user", "content": user_text},
+        {"role": "user",  "content": user_text},
         {"role": "model", "content": reply},
     ]
     return AgentResponse(
@@ -263,9 +243,6 @@ def chat_voice(req: VoiceRequest) -> AgentResponse:
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Entry-point
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True)

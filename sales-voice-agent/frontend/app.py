@@ -140,7 +140,7 @@ CSS = """
 footer { display: none !important; }
 """
 
-with gr.Blocks(theme=gr.themes.Soft(), css=CSS, title="🤖 Sales Voice Agent") as demo:
+with gr.Blocks(title="🤖 Sales Voice Agent") as demo:
 
     # ── shared state ──────────────────────────────────────────────────────
     history_state = gr.State([])    # list[{"role": ..., "content": ...}]
@@ -287,4 +287,6 @@ if __name__ == "__main__":
         server_port=7860,
         share=False,
         show_error=True,
+        theme=gr.themes.Soft(),
+        css=CSS,
     )
