@@ -71,9 +71,9 @@ Inbound B2B sales teams face four fundamental bottlenecks:
 flowchart TD
     User["👤 Prospect (Web / Microphone)"] <--> UI["🖥️ Gradio 6 Frontend (Port 7860)<br/>Voice/Text Chat + Live Lead Panel + Booking + CRM Dashboard"]
     
-    UI -->|POST /chat/voice (Base64 WAV)| API["⚡ FastAPI Orchestrator (Port 8000)<br/>backend/main.py"]
-    UI -->|POST /chat/text (JSON)| API
-    UI -->|POST /appointments/book & /call/summary| API
+    UI -->|"POST /chat/voice - Base64 WAV"| API["⚡ FastAPI Orchestrator (Port 8000)<br/>backend/main.py"]
+    UI -->|"POST /chat/text - JSON"| API
+    UI -->|"POST /appointments/book & /call/summary"| API
 
     subgraph VoiceLayer["Voice I/O Layer (Graceful Fallback)"]
         STT["🎙️ Deepgram Nova-2 STT<br/>(Fallback: Google Cloud Speech)"]
